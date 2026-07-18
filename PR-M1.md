@@ -61,9 +61,38 @@ The `*locals*` alist keys are symbols, but they are NOT always the same `eq` ide
 1. **Closure env-locals** (`compile-closure-body` line 3054): when a free var is captured, the env-local is interned in `DOTCL.CIL-COMPILER` — `(intern fv :dotcl.cil-compiler)` — but the reference inside the closure body uses the ORIGINAL source symbol (e.g. `PARSONIC::|...|`). These are `eq`-unequal but have the same `var-name`.
 2. **Uninterned gensyms**: source code may use `#:G123`, while `*locals*` holds an interned version with the same effective name. Pure `eq` fails here too.
 
-**Verified empirically**: removing the string fallback entirely (pure `eq` in `lookup-local`/`local-bound-p`) breaks the build with `Unbound variable: #:PTR536` — an uninterned gensym that relies on the string fallback.
+### Demonstration: pure `eq` breaks the build
 
-So the string fallback MUST stay, but it must not match across user packages. The fix restricts the fallback to "compatible" packages only.
+Replacing `lookup-local`/`local-bound-p` with pure `eq` (removing the string fallback entirely) breaks the build at the ASDF compilation step:
+
+```
+=== Compiling ASDF → asdf.fasl ===
+Unhandled exception. DotCL.LispErrorException: Unbound variable: #:PTR536
+```
+
+**Trace of the failure**:
+
+1. ASDF uses `(loop :for k :being :the :hash-keys :of table ...)` (contrib/asdf/asdf.lisp lines 454, 843, 9024, ...).
+2. `loop.lisp` (line 1989) expands this to `(with-hash-table-iterator (next-fn ht-var) ...)`.
+3. `with-hash-table-iterator` macro (cil-macros.lisp:4338-4342) creates `(gensym "PTR")` → `#:PTR536`, binds it with `let*`, and captures it in a `flet` closure:
+   ```lisp
+   (let* ((,pairs-var (hash-table-pairs ,ht-expr))
+           (,ptr-var ,pairs-var))           ; #:PTR536 bound here
+     (flet ((,fn-var ()
+              (if ,ptr-var                 ; referenced inside closure
+                  (let ((pair (car ,ptr-var)))
+                    (setf ,ptr-var (cdr ,ptr-var))
+                    (values t (car pair) (cdr pair)))
+                  nil)))
+       ...))
+   ```
+4. The compiler captures `#:PTR536` as a free var. `compile-closure-body` (cil-forms.lisp:3054) interns it for the env-local: `(intern "PTR536" :dotcl.cil-compiler)` → `DOTCL.CIL-COMPILER::PTR536`.
+5. Inside the closure, `*locals*` has `(DOTCL.CIL-COMPILER::PTR536 . env-key)`, but the reference symbol is the uninterned `#:PTR536`.
+6. Pure `eq`: `#:PTR536` ≠ `DOTCL.CIL-COMPILER::PTR536` → `lookup-local` returns nil → "Unbound variable: #:PTR536".
+
+The string fallback is essential for this gensym case. The package-aware `same-var-package-p` handles it correctly: `#:PTR536` has `null` package → `(null k-pkg)` is true → returns `(var-name k)` → matches `DOTCL.CIL-COMPILER::PTR536` by name.
+
+So the string fallback MUST stay, but it must not match across user packages. The fix restricts the fallback to "compatible" packages only: same package, `DOTCL.CIL-COMPILER` (closure env-locals), or uninterned (gensyms).
 
 ### `compiler/cil-compiler.lisp`
 
