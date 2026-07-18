@@ -1263,6 +1263,71 @@ public static partial class Runtime
     }
 
     /// <summary>
+    /// Snapshot all symbols (across every package) that currently have a
+    /// Function or SetfFunction binding. Used by CompileFile to identify
+    /// pre-existing bindings so its ANSI 3.2.3.1 finally strip only removes
+    /// Function/SetfFunction values that THIS compile-file established.
+    /// Re-snapshotting after a compile-time (require ...) extends the "pre"
+    /// set to include bindings established by the require'd module, so the
+    /// strip does not remove a loaded module's defuns (a separate
+    /// compilation unit's side effects must persist).
+    /// </summary>
+    private static (System.Collections.Generic.HashSet<Symbol> preFn,
+                    System.Collections.Generic.HashSet<Symbol> preSetf) SnapshotFnBindings()
+    {
+        var fn = new System.Collections.Generic.HashSet<Symbol>();
+        var setf = new System.Collections.Generic.HashSet<Symbol>();
+        foreach (var pkg in Package.AllPackages.ToList())
+        {
+            foreach (var s in pkg.ExternalSymbols)
+            {
+                if (s.Function != null) fn.Add(s);
+                if (s.SetfFunction != null) setf.Add(s);
+            }
+            foreach (var s in pkg.InternalSymbols)
+            {
+                if (s.Function != null) fn.Add(s);
+                if (s.SetfFunction != null) setf.Add(s);
+            }
+        }
+        return (fn, setf);
+    }
+
+    /// <summary>
+    /// Walk a top-level form looking for any (require ...) call. Returns true
+    /// if a require form is found within the form's top-level structure
+    /// (descends into progn / eval-when / locally wrappers, since
+    /// FlattenTopLevel and IsEvalWhenForCompileFile unwrap those before
+    /// execution). Used by CompileFile to decide whether to re-snapshot
+    /// function bindings after executing a compile-time form: a require'd
+    /// module's defuns must be treated as pre-existing for the finally strip.
+    /// </summary>
+    private static bool FormInvokesRequireP(LispObject form)
+    {
+        if (form is Cons c && c.Car is Symbol sym)
+        {
+            if (sym.Name == "REQUIRE")
+                return true;
+            // Descend into wrappers that FlattenTopLevel / the compile loop
+            // unwrap before executing the body: PROGN, EVAL-WHEN, LOCALLY.
+            if (sym.Name == "PROGN" || sym.Name == "LOCALLY")
+            {
+                for (var body = c.Cdr; body is Cons bc; body = bc.Cdr)
+                    if (FormInvokesRequireP(bc.Car)) return true;
+                return false;
+            }
+            if (sym.Name == "EVAL-WHEN" && c.Cdr is Cons rest)
+            {
+                // (eval-when (situations) body...) — skip situations list.
+                for (var body = rest.Cdr; body is Cons bc; body = bc.Cdr)
+                    if (FormInvokesRequireP(bc.Car)) return true;
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
     /// Register proper macro expanders for WHEN, UNLESS, COND, AND, OR so that
     /// macroexpand-1 returns their actual expansions. Code walkers (e.g. iterate)
     /// need this to see inside these forms.
@@ -1740,21 +1805,19 @@ public static partial class Runtime
         // leak into the global environment after compile-file returns
         // (otherwise (compile-file foo.lisp) would side-effect (fboundp 'bar)
         // for any defun in foo.lisp — failing pfdietz COMPILE-FILE.* tests).
-        var preFn = new System.Collections.Generic.HashSet<Symbol>();
-        var preSetf = new System.Collections.Generic.HashSet<Symbol>();
-        foreach (var pkg in Package.AllPackages.ToList())
-        {
-            foreach (var s in pkg.ExternalSymbols)
-            {
-                if (s.Function != null) preFn.Add(s);
-                if (s.SetfFunction != null) preSetf.Add(s);
-            }
-            foreach (var s in pkg.InternalSymbols)
-            {
-                if (s.Function != null) preFn.Add(s);
-                if (s.SetfFunction != null) preSetf.Add(s);
-            }
-        }
+        //
+        // The snapshot is refreshed after each compile-time (require ...) so
+        // that function bindings established by the require'd module (a
+        // separate compilation unit) are treated as pre-existing and survive
+        // the finally strip. Without this, a (require "lib") inside an
+        // eval-when :compile-toplevel would have its defuns stripped, then the
+        // load-time require (if skipped because *modules* already lists the
+        // module) would leave them unbound — see require-defun-clobber
+        // regression. ANSI 3.2.3.1 only intends to strip side effects of THE
+        // FILE being compiled, not of modules it loads.
+        System.Collections.Generic.HashSet<Symbol> preFn = new();
+        System.Collections.Generic.HashSet<Symbol> preSetf = new();
+        (preFn, preSetf) = SnapshotFnBindings();
 
         // FASL module name must be computed before the module-ID binding (declared below).
         // :module-name pins it to a stable string (build-time-link / AOT); otherwise
@@ -1851,7 +1914,15 @@ public static partial class Runtime
                             var bodyInstrList = CompileTopLevel(prognForm);
 
                             if (hasCT)
+                            {
                                 DotCL.Emitter.CilAssembler.AssembleAndRun(bodyInstrList);
+                                // A compile-time (require ...) inside the
+                                // eval-when loaded a separate module whose
+                                // defuns must survive the finally strip —
+                                // re-snapshot so they count as pre-existing.
+                                if (FormInvokesRequireP(subForm))
+                                    (preFn, preSetf) = SnapshotFnBindings();
+                            }
 
                             if (hasLT)
                             {
@@ -1864,7 +1935,16 @@ public static partial class Runtime
                         {
                             var instrList = CompileTopLevel(subForm);
                             if (ShouldExecuteAtCompileTime(subForm))
+                            {
                                 DotCL.Emitter.CilAssembler.AssembleAndRun(instrList);
+                                // A top-level (require ...) loaded a separate
+                                // module whose defuns must survive the finally
+                                // strip — re-snapshot so they count as
+                                // pre-existing (ANSI 3.2.3.1 strips only the
+                                // side effects of THIS file, not loaded modules).
+                                if (FormInvokesRequireP(subForm))
+                                    (preFn, preSetf) = SnapshotFnBindings();
+                            }
                             writer?.WriteLine(instrList.ToString());
                             faslAsm.AddTopLevelForm(instrList);
                             faslAsm.FlushInitForms();

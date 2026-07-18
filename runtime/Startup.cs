@@ -992,24 +992,12 @@ public static class Startup
             var (sym, status) = pkg.FindSymbol(name);
             if (status != SymbolStatus.None) { _symInPkgCache[key] = sym; return sym; }
             var (newSym, _) = pkg.Intern(name);
-            // Cross-package Function bridge (replaces the old _functions flat
-            // table) Phase 3: when newly interning into a user
-            // package (e.g., DOTCL-THREAD), inherit the Function slot from any
-            // existing same-named symbol that has one (e.g. DOTCL-INTERNAL's
-            // runtime-registered helper). Copy-on-intern only.
-            if (newSym.Function == null)
-            {
-                foreach (var otherPkg in Package.AllPackages)
-                {
-                    if (otherPkg == pkg) continue;
-                    var (existingSym, existingStatus) = otherPkg.FindSymbol(name);
-                    if (existingStatus != SymbolStatus.None && existingSym.Function != null)
-                    {
-                        newSym.Function = existingSym.Function;
-                        break;
-                    }
-                }
-            }
+            // Cross-package Function bridge at intern time removed: it copied
+            // a same-named symbol's Function onto newSym, but
+            // RegisterFunctionOnSymbolGuarded (FaslAssembler.cs) overwrites
+            // sym.Function immediately after SymInPkg returns, so the copy was
+            // never observable. Cross-package call resolution is handled at
+            // call time via FindFunctionAcrossPackages (CilAssembler).
             _symInPkgCache[key] = newSym;
             return newSym;
         }

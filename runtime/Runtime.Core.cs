@@ -642,10 +642,13 @@ public static partial class Runtime
             // Cross-package bridge: closure defuns compiled inside a let may
             // register via RegisterFunction(string,fn) which lands on a
             // DOTCL-INTERNAL symbol rather than the home-package symbol. Same
-            // fallback as GetFunctionBySymbol (shared helper, incl. caching the
-            // hit on sym.Function) so that (funcall sym) finds the function
-            // even when sym.Function is null.
-            if (Emitter.CilAssembler.FindFunctionAcrossPackages(sym, cacheOnSym: true)
+            // fallback as GetFunctionBySymbol (shared helper). The hit is NOT
+            // cached on sym.Function: caching a foreign package's function
+            // here would alias the two (eq → T) and cause infinite recursion
+            // when the symbol's own defun body calls the foreign same-named
+            // function (require-defun-clobber Mechanism A). The symbol stays
+            // fboundp NIL; call resolution re-searches packages each time.
+            if (Emitter.CilAssembler.FindFunctionAcrossPackages(sym, cacheOnSym: false)
                 is LispFunction otherFn)
                 return otherFn;
             throw new LispErrorException(new LispUndefinedFunction(sym));

@@ -259,13 +259,18 @@ public partial class CilAssembler
     /// Symbol-based function lookup. sym.Function is primary. If empty,
     /// fall back to any same-named symbol in another package that has a
     /// Function — replaces the old _functions flat
-    /// table as a cross-package bridge. Caches the result on sym.Function
-    /// to make subsequent lookups O(1).
+    /// table as a cross-package bridge. The hit is NOT cached on sym.Function:
+    /// caching a foreign package's function onto this symbol would alias the
+    /// two (eq → T) and cause infinite recursion when the symbol's own defun
+    /// body calls the foreign same-named function (require-defun-clobber
+    /// Mechanism A). The lookup symbol stays fboundp NIL; call resolution
+    /// re-searches packages each time, which is only hit for genuinely unbound
+    /// symbols (the bound common case returns at the sym.Function check above).
     /// </summary>
     public static LispFunction GetFunctionBySymbol(Symbol sym)
     {
         if (sym.Function is LispFunction symFn) return symFn;
-        if (FindFunctionAcrossPackages(sym, cacheOnSym: true) is LispFunction otherFn)
+        if (FindFunctionAcrossPackages(sym, cacheOnSym: false) is LispFunction otherFn)
             return otherFn;
         throw new LispErrorException(new LispUndefinedFunction(sym));
     }
